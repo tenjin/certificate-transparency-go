@@ -28,9 +28,9 @@ import (
 
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/fixchain"
-	"github.com/google/certificate-transparency-go/fixchain/ratelimiter"
 	"github.com/google/certificate-transparency-go/jsonclient"
 	"github.com/google/certificate-transparency-go/x509"
+	"golang.org/x/time/rate"
 )
 
 // Assumes chains to be stores in a file in JSON encoded with the certificates
@@ -76,14 +76,18 @@ func contentStore(baseDir string, subDir string, content []byte) {
 	r := sha256.Sum256(content)
 	h := base64.URLEncoding.EncodeToString(r[:])
 	d := baseDir + "/" + subDir
-	os.MkdirAll(d, 0777)
+	if err := os.MkdirAll(d, 0777); err != nil {
+		log.Fatalf("Can't create directories %q: %v", d, err)
+	}
 	fn := d + "/" + h
 	f, err := os.Create(fn)
 	if err != nil {
 		log.Fatalf("Can't create %q: %s", fn, err)
 	}
 	defer f.Close()
-	f.Write(content)
+	if _, err := f.Write(content); err != nil {
+		log.Fatalf("Can't write to %q: %v", fn, err)
+	}
 }
 
 func logStringErrors(wg *sync.WaitGroup, errors chan *fixchain.FixError, baseDir string) {
@@ -106,7 +110,7 @@ func main() {
 	// As-is, this will log errors as strings.
 	go logStringErrors(&wg, errors, errDir)
 
-	limiter := ratelimiter.NewLimiter(1000)
+	limiter := rate.NewLimiter(rate.Limit(1000), 1)
 	c := &http.Client{}
 	logClient, err := client.New(logURL, c, jsonclient.Options{UserAgent: "ct-go-fixchain/1.0"})
 	if err != nil {

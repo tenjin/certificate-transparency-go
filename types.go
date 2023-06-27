@@ -31,14 +31,14 @@ import (
 ///////////////////////////////////////////////////////////////////////////////
 
 // LogEntryType represents the LogEntryType enum from section 3.1:
-//   enum { x509_entry(0), precert_entry(1), (65535) } LogEntryType;
+//
+//	enum { x509_entry(0), precert_entry(1), (65535) } LogEntryType;
 type LogEntryType tls.Enum // tls:"maxval:65535"
 
 // LogEntryType constants from section 3.1.
 const (
 	X509LogEntryType    LogEntryType = 0
 	PrecertLogEntryType LogEntryType = 1
-	XJSONLogEntryType   LogEntryType = 0x8000 // Experimental.  Don't rely on this!
 )
 
 func (e LogEntryType) String() string {
@@ -47,8 +47,6 @@ func (e LogEntryType) String() string {
 		return "X509LogEntryType"
 	case PrecertLogEntryType:
 		return "PrecertLogEntryType"
-	case XJSONLogEntryType:
-		return "XJSONLogEntryType"
 	default:
 		return fmt.Sprintf("UnknownEntryType(%d)", e)
 	}
@@ -61,7 +59,8 @@ const (
 )
 
 // MerkleLeafType represents the MerkleLeafType enum from section 3.4:
-//   enum { timestamped_entry(0), (255) } MerkleLeafType;
+//
+//	enum { timestamped_entry(0), (255) } MerkleLeafType;
 type MerkleLeafType tls.Enum // tls:"maxval:255"
 
 // TimestampedEntryLeafType is the only defined MerkleLeafType constant from section 3.4.
@@ -77,7 +76,8 @@ func (m MerkleLeafType) String() string {
 }
 
 // Version represents the Version enum from section 3.2:
-//   enum { v1(0), (255) } Version;
+//
+//	enum { v1(0), (255) } Version;
 type Version tls.Enum // tls:"maxval:255"
 
 // CT Version constants from section 3.2.
@@ -95,7 +95,8 @@ func (v Version) String() string {
 }
 
 // SignatureType differentiates STH signatures from SCT signatures, see section 3.2.
-//   enum { certificate_timestamp(0), tree_hash(1), (255) } SignatureType;
+//
+//	enum { certificate_timestamp(0), tree_hash(1), (255) } SignatureType;
 type SignatureType tls.Enum // tls:"maxval:255"
 
 // SignatureType constants from section 3.2.
@@ -135,7 +136,7 @@ type PreCert struct {
 
 // CTExtensions is a representation of the raw bytes of any CtExtension
 // structure (see section 3.2).
-// nolint: golint
+// nolint: revive
 type CTExtensions []byte // tls:"minlen:0,maxlen:65535"`
 
 // MerkleTreeNode represents an internal node in the CT tree.

@@ -25,12 +25,11 @@ import (
 
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/client"
-	"github.com/google/certificate-transparency-go/dnsclient"
 	"github.com/google/certificate-transparency-go/jsonclient"
-	"github.com/google/certificate-transparency-go/loglist"
+	"github.com/google/certificate-transparency-go/loglist3"
 	"github.com/google/certificate-transparency-go/x509"
-	"github.com/google/trillian/merkle"
-	"github.com/google/trillian/merkle/rfc6962"
+	"github.com/transparency-dev/merkle/proof"
+	"github.com/transparency-dev/merkle/rfc6962"
 )
 
 // LogInfo holds the objects needed to perform per-log verification and
@@ -47,7 +46,7 @@ type LogInfo struct {
 }
 
 // NewLogInfo builds a LogInfo object based on a log list entry.
-func NewLogInfo(log *loglist.Log, hc *http.Client) (*LogInfo, error) {
+func NewLogInfo(log *loglist3.Log, hc *http.Client) (*LogInfo, error) {
 	url := log.URL
 	if !strings.HasPrefix(url, "https://") {
 		url = "https://" + url
@@ -59,25 +58,7 @@ func NewLogInfo(log *loglist.Log, hc *http.Client) (*LogInfo, error) {
 	return newLogInfo(log, lc)
 }
 
-// NewLogInfoOverDNSWrapper builds a LogInfo object that accesses logs via DNS, based on a log list entry.
-// The inert http.Client argument allows this variant to be used interchangeably with NewLogInfo.
-func NewLogInfoOverDNSWrapper(log *loglist.Log, _ *http.Client) (*LogInfo, error) {
-	return NewLogInfoOverDNS(log)
-}
-
-// NewLogInfoOverDNS builds a LogInfo object that accesses logs via DNS, based on a log list entry.
-func NewLogInfoOverDNS(log *loglist.Log) (*LogInfo, error) {
-	if log.DNSAPIEndpoint == "" {
-		return nil, fmt.Errorf("no available DNS endpoint for log %q", log.Description)
-	}
-	dc, err := dnsclient.New(log.DNSAPIEndpoint, jsonclient.Options{PublicKeyDER: log.Key})
-	if err != nil {
-		return nil, fmt.Errorf("failed to create DNS client for log %q: %v", log.Description, err)
-	}
-	return newLogInfo(log, dc)
-}
-
-func newLogInfo(log *loglist.Log, lc client.CheckLogClient) (*LogInfo, error) {
+func newLogInfo(log *loglist3.Log, lc client.CheckLogClient) (*LogInfo, error) {
 	logKey, err := x509.ParsePKIXPublicKey(log.Key)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse public key data for log %q: %v", log.Description, err)
@@ -86,7 +67,7 @@ func newLogInfo(log *loglist.Log, lc client.CheckLogClient) (*LogInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to build verifier log %q: %v", log.Description, err)
 	}
-	mmd := time.Duration(log.MaximumMergeDelay) * time.Second
+	mmd := time.Duration(log.MMD) * time.Second
 	return &LogInfo{
 		Description: log.Description,
 		Client:      lc,
@@ -100,24 +81,21 @@ func newLogInfo(log *loglist.Log, lc client.CheckLogClient) (*LogInfo, error) {
 type LogInfoByHash map[[sha256.Size]byte]*LogInfo
 
 // LogInfoByKeyHash builds a map of LogInfo objects indexed by their key hashes.
-func LogInfoByKeyHash(ll *loglist.LogList, hc *http.Client) (LogInfoByHash, error) {
+func LogInfoByKeyHash(ll *loglist3.LogList, hc *http.Client) (LogInfoByHash, error) {
 	return logInfoByKeyHash(ll, hc, NewLogInfo)
 }
 
-// LogInfoByKeyHashOverDNS builds a map of LogInfo objects (for access over DNS) indexed by their key hashes.
-func LogInfoByKeyHashOverDNS(ll *loglist.LogList, hc *http.Client) (LogInfoByHash, error) {
-	return logInfoByKeyHash(ll, hc, NewLogInfoOverDNSWrapper)
-}
-
-func logInfoByKeyHash(ll *loglist.LogList, hc *http.Client, infoFactory func(*loglist.Log, *http.Client) (*LogInfo, error)) (map[[sha256.Size]byte]*LogInfo, error) {
+func logInfoByKeyHash(ll *loglist3.LogList, hc *http.Client, infoFactory func(*loglist3.Log, *http.Client) (*LogInfo, error)) (map[[sha256.Size]byte]*LogInfo, error) {
 	result := make(map[[sha256.Size]byte]*LogInfo)
-	for _, log := range ll.Logs {
-		h := sha256.Sum256(log.Key)
-		li, err := infoFactory(&log, hc)
-		if err != nil {
-			return nil, err
+	for _, operator := range ll.Operators {
+		for _, log := range operator.Logs {
+			h := sha256.Sum256(log.Key)
+			li, err := infoFactory(log, hc)
+			if err != nil {
+				return nil, err
+			}
+			result[h] = li
 		}
-		result[h] = li
 	}
 	return result, nil
 }
@@ -189,8 +167,7 @@ func (li *LogInfo) VerifyInclusionAt(ctx context.Context, leaf ct.MerkleTreeLeaf
 		return -1, fmt.Errorf("failed to GetProofByHash(sct,size=%d): %v", treeSize, err)
 	}
 
-	verifier := merkle.NewLogVerifier(rfc6962.DefaultHasher)
-	if err := verifier.VerifyInclusionProof(rsp.LeafIndex, int64(treeSize), rsp.AuditPath, rootHash, leafHash[:]); err != nil {
+	if err := proof.VerifyInclusion(rfc6962.DefaultHasher, uint64(rsp.LeafIndex), treeSize, leafHash[:], rsp.AuditPath, rootHash); err != nil {
 		return -1, fmt.Errorf("failed to verify inclusion proof at size %d: %v", treeSize, err)
 	}
 	return rsp.LeafIndex, nil

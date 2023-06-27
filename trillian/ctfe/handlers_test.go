@@ -22,17 +22,16 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/golang/mock/gomock"
 	"github.com/google/certificate-transparency-go/tls"
 	"github.com/google/certificate-transparency-go/trillian/mockclient"
@@ -43,13 +42,13 @@ import (
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/google/trillian"
-	"github.com/google/trillian/crypto/keys/pem"
 	"github.com/google/trillian/monitoring"
 	"github.com/google/trillian/types"
 	"github.com/kylelemons/godebug/pretty"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/klog/v2"
 
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/trillian/ctfe/configpb"
@@ -109,7 +108,7 @@ const remoteQuotaUser = "Moneybags"
 
 type handlerTestInfo struct {
 	mockCtrl *gomock.Controller
-	roots    *PEMCertPool
+	roots    *x509util.PEMCertPool
 	client   *mockclient.MockTrillianLogClient
 	li       *logInfo
 }
@@ -154,7 +153,7 @@ func setupTest(t *testing.T, pemRoots []string, signer crypto.Signer) handlerTes
 	t.Helper()
 	info := handlerTestInfo{
 		mockCtrl: gomock.NewController(t),
-		roots:    NewPEMCertPool(),
+		roots:    x509util.NewPEMCertPool(),
 	}
 
 	info.client = mockclient.NewMockTrillianLogClient(info.mockCtrl)
@@ -170,7 +169,7 @@ func setupTest(t *testing.T, pemRoots []string, signer crypto.Signer) handlerTes
 
 	for _, pemRoot := range pemRoots {
 		if !info.roots.AppendCertsFromPEM([]byte(pemRoot)) {
-			glog.Fatal("failed to load cert pool")
+			klog.Fatal("failed to load cert pool")
 		}
 	}
 
@@ -751,7 +750,8 @@ func TestGetSTH(t *testing.T) {
 		},
 	}
 
-	key, err := pem.UnmarshalPublicKey(testdata.DemoPublicKey)
+	block, _ := pem.Decode([]byte(testdata.DemoPublicKey))
+	key, err := x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {
 		t.Fatalf("Failed to load public key: %v", err)
 	}
@@ -1469,7 +1469,7 @@ func TestGetProofByHash(t *testing.T) {
 		if got, want := w.Header().Get("Cache-Control"), "public"; !strings.Contains(got, want) {
 			t.Errorf("proofByHash(%q): Cache-Control response header = %q, want %q", test.req, got, want)
 		}
-		jsonData, err := ioutil.ReadAll(w.Body)
+		jsonData, err := io.ReadAll(w.Body)
 		if err != nil {
 			t.Errorf("failed to read response body: %v", err)
 			continue
@@ -1825,7 +1825,7 @@ func TestGetSTHConsistency(t *testing.T) {
 		if got, want := w.Header().Get("Cache-Control"), "public"; !strings.Contains(got, want) {
 			t.Errorf("getSTHConsistency(%q): Cache-Control response header = %q, want %q", test.req, got, want)
 		}
-		jsonData, err := ioutil.ReadAll(w.Body)
+		jsonData, err := io.ReadAll(w.Body)
 		if err != nil {
 			t.Errorf("failed to read response body: %v", err)
 			continue
@@ -2171,7 +2171,7 @@ func TestGetEntryAndProof(t *testing.T) {
 	}
 }
 
-func createJSONChain(t *testing.T, p PEMCertPool) io.Reader {
+func createJSONChain(t *testing.T, p x509util.PEMCertPool) io.Reader {
 	t.Helper()
 	var req ct.AddChainRequest
 	for _, rawCert := range p.RawCertificates() {
@@ -2272,9 +2272,9 @@ func makeGetRootResponseForTest(t *testing.T, stamp, treeSize int64, hash []byte
 	}
 }
 
-func loadCertsIntoPoolOrDie(t *testing.T, certs []string) *PEMCertPool {
+func loadCertsIntoPoolOrDie(t *testing.T, certs []string) *x509util.PEMCertPool {
 	t.Helper()
-	pool := NewPEMCertPool()
+	pool := x509util.NewPEMCertPool()
 	for _, cert := range certs {
 		if !pool.AppendCertsFromPEM([]byte(cert)) {
 			t.Fatalf("couldn't parse test certs: %v", certs)

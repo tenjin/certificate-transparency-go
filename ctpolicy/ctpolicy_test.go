@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/certificate-transparency-go/loglist2"
+	"github.com/google/certificate-transparency-go/loglist3"
 	"github.com/google/certificate-transparency-go/testdata"
 	"github.com/google/certificate-transparency-go/x509"
 	"github.com/google/certificate-transparency-go/x509util"
@@ -27,7 +27,7 @@ import (
 
 func getTestCertPEMShort() *x509.Certificate {
 	cert, _ := x509util.CertificateFromPEM([]byte(testdata.TestCertPEM))
-	cert.NotAfter = time.Date(2013, 1, 1, 0, 0, 0, 0, time.UTC)
+	cert.NotAfter = time.Date(2012, 6, 1, 0, 0, 0, 0, time.UTC)
 	return cert
 }
 
@@ -48,12 +48,12 @@ func getTestCertPEMLongOriginal() *x509.Certificate {
 	return cert
 }
 
-func sampleLogList(t *testing.T) *loglist2.LogList {
+func sampleLogList(t *testing.T) *loglist3.LogList {
 	t.Helper()
-	var ll loglist2.LogList
-	err := json.Unmarshal([]byte(testdata.SampleLogList2), &ll)
+	var ll loglist3.LogList
+	err := json.Unmarshal([]byte(testdata.SampleLogList3), &ll)
 	if err != nil {
-		t.Fatalf("Unable to Unmarshal testdata.SampleLogList2 %v", err)
+		t.Fatalf("Unable to Unmarshal testdata.SampleLogList3 %v", err)
 	}
 	return &ll
 }
@@ -99,6 +99,52 @@ func TestLifetimeInMonths(t *testing.T) {
 			got := lifetimeInMonths(cert)
 			if got != test.want {
 				t.Errorf("lifetimeInMonths(%v, %v)=%d, want %d", test.notBefore, test.notAfter, got, test.want)
+			}
+		})
+	}
+}
+
+func TestCertLifetime(t *testing.T) {
+	tests := []struct {
+		name      string
+		notBefore time.Time
+		notAfter  time.Time
+		want      time.Duration
+	}{
+		{
+			name:      "ExactDays",
+			notBefore: time.Date(2012, 6, 1, 0, 0, 0, 0, time.UTC),
+			notAfter:  time.Date(2013, 1, 1, 0, 0, 0, 0, time.UTC),
+			want:      18489600 * time.Second,
+		},
+		{
+			name:      "ExactYears",
+			notBefore: time.Date(2012, 6, 1, 0, 0, 0, 0, time.UTC),
+			notAfter:  time.Date(2015, 1, 1, 0, 0, 0, 0, time.UTC),
+			want:      81561600 * time.Second,
+		},
+		{
+			name:      "PartialSingleDay",
+			notBefore: time.Date(2012, 6, 1, 0, 0, 0, 0, time.UTC),
+			notAfter:  time.Date(2012, 6, 1, 15, 0, 0, 0, time.UTC),
+			want:      54000 * time.Second,
+		},
+		{
+			name:      "PartialDays",
+			notBefore: time.Date(2012, 6, 25, 0, 0, 0, 0, time.UTC),
+			notAfter:  time.Date(2012, 6, 30, 12, 0, 0, 0, time.UTC),
+			want:      475200 * time.Second,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cert := getTestCertPEMLongOriginal()
+			cert.NotBefore = test.notBefore
+			cert.NotAfter = test.notAfter
+			got := certLifetime(cert)
+			if got != test.want {
+				t.Errorf("certLifetime(%v, %v)=%d, want %d", test.notBefore, test.notAfter, got, test.want)
 			}
 		})
 	}

@@ -11,8 +11,6 @@ readonly CT_GO_PATH=$(go list -f '{{.Dir}}' github.com/google/certificate-transp
 
 # ct_prep_test prepares a set of running processes for a CT test.
 # Parameters:
-#   - number of log servers to run
-#   - number of log signers to run
 #   - number of CT personality instances to run
 # Populates:
 #  - CT_SERVERS         : list of HTTP addresses (comma separated)
@@ -21,24 +19,13 @@ readonly CT_GO_PATH=$(go list -f '{{.Dir}}' github.com/google/certificate-transp
 #  - CT_SERVER_PIDS     : bash array of CT HTTP server pids
 # in addition to the variables populated by log_prep_test.
 # If etcd and Prometheus are configured, it also populates:
-#  - ETCDISCOVER_PID   : pid of etcd service watcher
 #  - PROMETHEUS_PID    : pid of local Prometheus server
 #  - PROMETHEUS_CFGDIR : Prometheus configuration directory
 ct_prep_test() {
   # Default to one of everything.
-  local rpc_server_count=${1:-1}
-  local log_signer_count=${2:-1}
-  local http_server_count=${3:-1}
+  local http_server_count=${1:-1}
 
-  if [[ "${HAMMER_GOSSIP}" != "off" ]]; then
-    # Wipe the cttest database
-    echo "Wiping and re-creating cttest database"
-    "${CT_GO_PATH}/scripts/resetctdb.sh" --force
-    # Wipe the incident database
-  fi
-
-  echo "Launching core Trillian log components"
-  log_prep_test "${rpc_server_count}" "${log_signer_count}"
+  echo "PREP: Trillian: ${RPC_SERVER_1} [${RPC_SERVERS}]"
 
   echo "Building CT personality code"
   go build github.com/google/certificate-transparency-go/trillian/ctfe/ct_server
@@ -74,20 +61,8 @@ ct_prep_test() {
   if [[ -x "${PROMETHEUS_DIR}/prometheus" ]]; then
     if [[ ! -z "${ETCD_OPTS}" ]]; then
         PROMETHEUS_CFGDIR="$(mktemp -d ${TMPDIR}/ct-prometheus-XXXXXX)"
-        local prom_cfg="${PROMETHEUS_CFGDIR}/config.yaml"
-        local etcdiscovered="${PROMETHEUS_CFGDIR}/trillian.json"
-        sed "s!@ETCDISCOVERED@!${etcdiscovered}!" ${CT_GO_PATH}/trillian/integration/prometheus.yml > "${prom_cfg}"
-        echo "Prometheus configuration in ${prom_cfg}:"
-        cat ${prom_cfg}
-
-        echo "Building etcdiscover"
-        go build github.com/google/trillian/monitoring/prometheus/etcdiscover
-
-        echo "Launching etcd service monitor updating ${etcdiscovered}"
-        ./etcdiscover ${ETCD_OPTS} --etcd_services=trillian-ctfe-metrics-http,trillian-logserver-http,trillian-logsigner-http -target=${etcdiscovered} --logtostderr &
-        ETCDISCOVER_PID=$!
         echo "Launching Prometheus (default location localhost:9090)"
-        ${PROMETHEUS_DIR}/prometheus --config.file=${prom_cfg} \
+        ${PROMETHEUS_DIR}/prometheus --config.file=${CT_GO_PATH}/trillian/integration/prometheus.yml \
                            --web.console.templates=${CT_GO_PATH}/trillian/integration/consoles \
                            --web.console.libraries=${CT_GO_PATH}/third_party/prometheus/console_libs &
         PROMETHEUS_PID=$!
@@ -140,13 +115,7 @@ ct_provision_cfg() {
 
   num_logs=$(grep -c '@TREE_ID@' ${cfg})
   for i in $(seq ${num_logs}); do
-    # TODO(daviddrysdale): Consider using distinct keys for each log
-    tree_id=$(./createtree \
-      --admin_server="${admin_server}" \
-      --private_key_format=PrivateKey \
-      --pem_key_path=${CT_GO_PATH}/trillian/testdata/log-rpc-server.privkey.pem \
-      --pem_key_password=towel \
-      --signature_algorithm=ECDSA)
+    tree_id=$(./createtree --admin_server="${admin_server}")
     echo "Created tree ${tree_id}"
     # Need suffix for sed -i to cope with both GNU and non-GNU (e.g. OS X) sed.
     sed -i'.bak' "1,/@TREE_ID@/s/@TREE_ID@/${tree_id}/" "${cfg}"
@@ -162,11 +131,7 @@ ct_stop_test() {
   if [[ "${PROMETHEUS_PID}" != "" ]]; then
     pids+=" ${PROMETHEUS_PID}"
   fi
-  if [[ "${ETCDISCOVER_PID}" != "" ]]; then
-    pids+=" ${ETCDISCOVER_PID}"
-  fi
   echo "Stopping CT HTTP servers (pids ${CT_SERVER_PIDS[@]})"
   pids+=" ${CT_SERVER_PIDS[@]}"
   kill_pid ${pids}
-  log_stop_test
 }

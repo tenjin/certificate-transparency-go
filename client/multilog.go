@@ -19,11 +19,10 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
+	"os"
 	"time"
 
-	"github.com/golang/protobuf/ptypes"
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/client/configpb"
 	"github.com/google/certificate-transparency-go/jsonclient"
@@ -44,7 +43,7 @@ func TemporalLogConfigFromFile(filename string) (*configpb.TemporalLogConfig, er
 		return nil, errors.New("log config filename empty")
 	}
 
-	cfgBytes, err := ioutil.ReadFile(filename)
+	cfgBytes, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read log config: %v", err)
 	}
@@ -203,17 +202,17 @@ func (tlc *TemporalLogClient) IndexByDate(when time.Time) (int, error) {
 func shardInterval(cfg *configpb.LogShardConfig) (interval, error) {
 	var interval interval
 	if cfg.NotAfterStart != nil {
-		t, err := ptypes.Timestamp(cfg.NotAfterStart)
-		if err != nil {
+		if err := cfg.NotAfterStart.CheckValid(); err != nil {
 			return interval, fmt.Errorf("failed to parse NotAfterStart: %v", err)
 		}
+		t := cfg.NotAfterStart.AsTime()
 		interval.lower = &t
 	}
 	if cfg.NotAfterLimit != nil {
-		t, err := ptypes.Timestamp(cfg.NotAfterLimit)
-		if err != nil {
+		if err := cfg.NotAfterLimit.CheckValid(); err != nil {
 			return interval, fmt.Errorf("failed to parse NotAfterLimit: %v", err)
 		}
+		t := cfg.NotAfterLimit.AsTime()
 		interval.upper = &t
 	}
 

@@ -129,10 +129,10 @@ main() {
           -timeout=${GO_TEST_TIMEOUT:-5m} \
           ${coverflags} \
           "$d"
-    done | xargs -I '{}' -P ${GO_TEST_PARALLELISM:-10} bash -c '{}'
+    done | xargs -I '{}' -P ${GO_TEST_PARALLELISM:-10} bash -c '{}' || exit 1
 
     [[ ${coverage} -eq 1 ]] && \
-      cat /tmp/ct_profile/*.out > /tmp/coverage.txt
+      cat /tmp/ct_profile/*.out > coverage.txt
   fi
 
   if [[ "${run_lint}" -eq 1 ]]; then

@@ -18,17 +18,15 @@ import (
 	"crypto"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"time"
 
-	"github.com/golang/glog"
-	"github.com/golang/protobuf/ptypes"
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/trillian/ctfe/configpb"
 	"github.com/google/certificate-transparency-go/x509"
-	"github.com/google/trillian/crypto/keys/der"
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
+	"k8s.io/klog/v2"
 )
 
 // ValidatedLogConfig represents the LogConfig with the information that has
@@ -36,7 +34,7 @@ import (
 type ValidatedLogConfig struct {
 	Config        *configpb.LogConfig
 	PubKey        crypto.PublicKey
-	PrivKey       ptypes.DynamicAny
+	PrivKey       proto.Message
 	KeyUsages     []x509.ExtKeyUsage
 	NotAfterStart *time.Time
 	NotAfterLimit *time.Time
@@ -47,7 +45,7 @@ type ValidatedLogConfig struct {
 // filename, which should contain text or binary-encoded protobuf configuration
 // data.
 func LogConfigFromFile(filename string) ([]*configpb.LogConfig, error) {
-	cfgBytes, err := ioutil.ReadFile(filename)
+	cfgBytes, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
@@ -83,7 +81,7 @@ func ToMultiLogConfig(cfg []*configpb.LogConfig, beSpec string) *configpb.LogMul
 // filename, which should contain text or binary-encoded protobuf configuration data.
 // Does not do full validation of the config but checks that it is non empty.
 func MultiLogConfigFromFile(filename string) (*configpb.LogMultiConfig, error) {
-	cfgBytes, err := ioutil.ReadFile(filename)
+	cfgBytes, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
@@ -102,25 +100,26 @@ func MultiLogConfigFromFile(filename string) (*configpb.LogMultiConfig, error) {
 }
 
 // ValidateLogConfig checks that a single log config is valid. In particular:
-//  - A mirror log has a valid public key and no private key.
-//  - A non-mirror log has a private, and optionally a public key (both valid).
-//  - Each of NotBeforeStart and NotBeforeLimit, if set, is a valid timestamp
-//    proto. If both are set then NotBeforeStart <= NotBeforeLimit.
-//  - Merge delays (if present) are correct.
-//  - Frozen STH (if present) is correct and signed by the provided public key.
+//   - A mirror log has a valid public key and no private key.
+//   - A non-mirror log has a private, and optionally a public key (both valid).
+//   - Each of NotBeforeStart and NotBeforeLimit, if set, is a valid timestamp
+//     proto. If both are set then NotBeforeStart <= NotBeforeLimit.
+//   - Merge delays (if present) are correct.
+//   - Frozen STH (if present) is correct and signed by the provided public key.
+//
 // Returns the validated structures (useful to avoid double validation).
 func ValidateLogConfig(cfg *configpb.LogConfig) (*ValidatedLogConfig, error) {
 	if cfg.LogId == 0 {
 		return nil, errors.New("empty log ID")
 	}
 
-	var err error
 	vCfg := ValidatedLogConfig{Config: cfg}
 
 	// Validate the public key.
 	if pubKey := cfg.PublicKey; pubKey != nil {
-		if vCfg.PubKey, err = der.UnmarshalPublicKey(pubKey.Der); err != nil {
-			return nil, fmt.Errorf("invalid public key: %v", err)
+		var err error
+		if vCfg.PubKey, err = x509.ParsePKIXPublicKey(pubKey.Der); err != nil {
+			return nil, fmt.Errorf("x509.ParsePKIXPublicKey: %w", err)
 		}
 	} else if cfg.IsMirror {
 		return nil, errors.New("empty public key for mirror")
@@ -133,9 +132,11 @@ func ValidateLogConfig(cfg *configpb.LogConfig) (*ValidatedLogConfig, error) {
 		if cfg.PrivateKey == nil {
 			return nil, errors.New("empty private key")
 		}
-		if err = ptypes.UnmarshalAny(cfg.PrivateKey, &vCfg.PrivKey); err != nil {
+		privKey, err := cfg.PrivateKey.UnmarshalNew()
+		if err != nil {
 			return nil, fmt.Errorf("invalid private key: %v", err)
 		}
+		vCfg.PrivKey = privKey
 	} else if cfg.PrivateKey != nil {
 		return nil, errors.New("unnecessary private key for mirror")
 	}
@@ -151,7 +152,7 @@ func ValidateLogConfig(cfg *configpb.LogConfig) (*ValidatedLogConfig, error) {
 				// If "Any" is specified, then we can ignore the entire list and
 				// just disable EKU checking.
 				if ku == x509.ExtKeyUsageAny {
-					glog.Infof("%s: Found ExtKeyUsageAny, allowing all EKUs", cfg.Prefix)
+					klog.Infof("%s: Found ExtKeyUsageAny, allowing all EKUs", cfg.Prefix)
 					vCfg.KeyUsages = nil
 					break
 				}
@@ -166,15 +167,17 @@ func ValidateLogConfig(cfg *configpb.LogConfig) (*ValidatedLogConfig, error) {
 	start, limit := cfg.NotAfterStart, cfg.NotAfterLimit
 	if start != nil {
 		vCfg.NotAfterStart = &time.Time{}
-		if *vCfg.NotAfterStart, err = ptypes.Timestamp(start); err != nil {
+		if err := start.CheckValid(); err != nil {
 			return nil, fmt.Errorf("invalid start timestamp: %v", err)
 		}
+		*vCfg.NotAfterStart = start.AsTime()
 	}
 	if limit != nil {
 		vCfg.NotAfterLimit = &time.Time{}
-		if *vCfg.NotAfterLimit, err = ptypes.Timestamp(limit); err != nil {
+		if err := limit.CheckValid(); err != nil {
 			return nil, fmt.Errorf("invalid limit timestamp: %v", err)
 		}
+		*vCfg.NotAfterLimit = limit.AsTime()
 	}
 	if start != nil && limit != nil && (*vCfg.NotAfterLimit).Before(*vCfg.NotAfterStart) {
 		return nil, errors.New("limit before start")

@@ -25,10 +25,10 @@ import (
 	"crypto/sha256"
 	"encoding/pem"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -36,7 +36,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/golang/protobuf/ptypes"
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/jsonclient"
 	"github.com/google/certificate-transparency-go/trillian/ctfe"
@@ -45,15 +44,16 @@ import (
 	"github.com/google/certificate-transparency-go/x509/pkix"
 	"github.com/google/trillian"
 	"github.com/google/trillian/crypto/keyspb"
-	"github.com/google/trillian/merkle"
-	"github.com/google/trillian/merkle/rfc6962"
 	"github.com/kylelemons/godebug/pretty"
+	"github.com/transparency-dev/merkle"
+	"github.com/transparency-dev/merkle/proof"
+	"github.com/transparency-dev/merkle/rfc6962"
 	"golang.org/x/net/context/ctxhttp"
-	"google.golang.org/genproto/protobuf/field_mask"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	ct "github.com/google/certificate-transparency-go"
-	keyspem "github.com/google/trillian/crypto/keys/pem"
 )
 
 const (
@@ -126,7 +126,7 @@ type testInfo struct {
 	adminServer    string
 	stats          *logStats
 	pool           ClientPool
-	verifier       merkle.LogVerifier
+	hasher         merkle.LogHasher
 }
 
 func (t *testInfo) checkStats() error {
@@ -183,8 +183,8 @@ func (t *testInfo) checkInclusionOf(ctx context.Context, chain []ct.ASN1Cert, sc
 	if err != nil {
 		return fmt.Errorf("got GetProofByHash(sct[%d],size=%d)=(nil,%v); want (_,nil)", 0, sth.TreeSize, err)
 	}
-	if err := t.verifier.VerifyInclusionProof(rsp.LeafIndex, int64(sth.TreeSize), rsp.AuditPath, sth.SHA256RootHash[:], leafHash[:]); err != nil {
-		return fmt.Errorf("got VerifyInclusionProof(%d, %d,...)=%v", 0, sth.TreeSize, err)
+	if err := proof.VerifyInclusion(t.hasher, uint64(rsp.LeafIndex), sth.TreeSize, leafHash[:], rsp.AuditPath, sth.SHA256RootHash[:]); err != nil {
+		return fmt.Errorf("got VerifyInclusion(%d, %d,...)=%v", 0, sth.TreeSize, err)
 	}
 	return nil
 }
@@ -214,8 +214,8 @@ func (t *testInfo) checkInclusionOfPreCert(ctx context.Context, tbs []byte, issu
 		return fmt.Errorf("got GetProofByHash(sct, size=%d)=nil,%v", sth.TreeSize, err)
 	}
 	fmt.Printf("%s: Inclusion proof leaf %d @ %d -> root %d = %x\n", t.prefix, rsp.LeafIndex, sct.Timestamp, sth.TreeSize, rsp.AuditPath)
-	if err := t.verifier.VerifyInclusionProof(rsp.LeafIndex, int64(sth.TreeSize), rsp.AuditPath, sth.SHA256RootHash[:], leafHash[:]); err != nil {
-		return fmt.Errorf("got VerifyInclusionProof(%d,%d,...)=%v; want nil", rsp.LeafIndex, sth.TreeSize, err)
+	if err := proof.VerifyInclusion(t.hasher, uint64(rsp.LeafIndex), sth.TreeSize, leafHash[:], rsp.AuditPath, sth.SHA256RootHash[:]); err != nil {
+		return fmt.Errorf("got VerifyInclusion(%d,%d,...)=%v; want nil", rsp.LeafIndex, sth.TreeSize, err)
 	}
 	if err := t.checkStats(); err != nil {
 		return fmt.Errorf("stats check failed: %v", err)
@@ -266,7 +266,7 @@ func RunCTIntegrationForLog(cfg *configpb.LogConfig, servers, metricsServers, te
 		metricsServers: metricsServers,
 		stats:          stats,
 		pool:           pool,
-		verifier:       merkle.NewLogVerifier(rfc6962.DefaultHasher),
+		hasher:         rfc6962.DefaultHasher,
 	}
 
 	if err := t.checkStats(); err != nil {
@@ -632,7 +632,7 @@ func RunCTLifecycleForLog(cfg *configpb.LogConfig, servers, metricsServers, admi
 		adminServer:    adminServer,
 		stats:          stats,
 		pool:           pool,
-		verifier:       merkle.NewLogVerifier(rfc6962.DefaultHasher),
+		hasher:         rfc6962.DefaultHasher,
 	}
 
 	if err := t.checkStats(); err != nil {
@@ -792,7 +792,7 @@ func timeFromMS(ts uint64) time.Time {
 
 // GetChain retrieves a certificate from a file of the given name and directory.
 func GetChain(dir, path string) ([]ct.ASN1Cert, error) {
-	certdata, err := ioutil.ReadFile(filepath.Join(dir, path))
+	certdata, err := os.ReadFile(filepath.Join(dir, path))
 	if err != nil {
 		return nil, fmt.Errorf("failed to load certificate: %v", err)
 	}
@@ -816,9 +816,8 @@ func CertsFromPEM(data []byte) []ct.ASN1Cert {
 }
 
 // checkCTConsistencyProof checks the given consistency proof.
-func (t *testInfo) checkCTConsistencyProof(sth1, sth2 *ct.SignedTreeHead, proof [][]byte) error {
-	return t.verifier.VerifyConsistencyProof(int64(sth1.TreeSize), int64(sth2.TreeSize),
-		sth1.SHA256RootHash[:], sth2.SHA256RootHash[:], proof)
+func (t *testInfo) checkCTConsistencyProof(sth1, sth2 *ct.SignedTreeHead, pf [][]byte) error {
+	return proof.VerifyConsistency(t.hasher, sth1.TreeSize, sth2.TreeSize, pf, sth1.SHA256RootHash[:], sth2.SHA256RootHash[:])
 }
 
 // buildNewPrecertData creates a new pre-certificate based on the given template cert (which is
@@ -849,7 +848,19 @@ func buildNewPrecertData(cert, issuer *x509.Certificate, signer crypto.Signer) (
 
 // MakeSigner creates a signer using the private key in the test directory.
 func MakeSigner(testDir string) (crypto.Signer, error) {
-	key, err := keyspem.ReadPrivateKeyFile(filepath.Join(testDir, "int-ca.privkey.pem"), "babelfish")
+	fileName := filepath.Join(testDir, "int-ca.privkey.pem")
+	keyPEM, err := os.ReadFile(fileName)
+	if err != nil {
+		return nil, fmt.Errorf("error reading file %q: %w", fileName, err)
+	}
+
+	block, _ := pem.Decode(keyPEM)
+	decPEM, err := x509.DecryptPEMBlock(block, []byte("babelfish"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt file %q: %w", fileName, err)
+	}
+
+	key, err := x509.ParseECPrivateKey(decPEM)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load private key for re-signing: %v", err)
 	}
@@ -901,7 +912,6 @@ func (ls *logStats) fromServer(ctx context.Context, servers string) (*logStats, 
 			return nil, fmt.Errorf("getting stats failed: %v", err)
 		}
 		defer httpRsp.Body.Close()
-		defer ioutil.ReadAll(httpRsp.Body)
 		if httpRsp.StatusCode != http.StatusOK {
 			return nil, fmt.Errorf("got HTTP Status %q", httpRsp.Status)
 		}
@@ -956,7 +966,7 @@ func (ls *logStats) check(cfg *configpb.LogConfig, servers string) error {
 }
 
 func setTreeState(ctx context.Context, adminServer string, logID int64, state trillian.TreeState) error {
-	treeStateMask := &field_mask.FieldMask{
+	treeStateMask := &fieldmaskpb.FieldMask{
 		Paths: []string{"tree_state"},
 	}
 
@@ -968,7 +978,7 @@ func setTreeState(ctx context.Context, adminServer string, logID int64, state tr
 		UpdateMask: treeStateMask,
 	}
 
-	conn, err := grpc.Dial(adminServer, grpc.WithInsecure())
+	conn, err := grpc.Dial(adminServer, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return err
 	}
@@ -990,25 +1000,25 @@ func NotAfterForLog(c *configpb.LogConfig) (time.Time, error) {
 	}
 
 	if c.NotAfterStart != nil {
-		start, err := ptypes.Timestamp(c.NotAfterStart)
-		if err != nil {
+		if err := c.NotAfterStart.CheckValid(); err != nil {
 			return time.Time{}, fmt.Errorf("failed to parse NotAfterStart: %v", err)
 		}
+		start := c.NotAfterStart.AsTime()
 		if c.NotAfterLimit == nil {
 			return start.Add(24 * time.Hour), nil
 		}
 
-		limit, err := ptypes.Timestamp(c.NotAfterLimit)
-		if err != nil {
+		if err := c.NotAfterLimit.CheckValid(); err != nil {
 			return time.Time{}, fmt.Errorf("failed to parse NotAfterLimit: %v", err)
 		}
+		limit := c.NotAfterLimit.AsTime()
 		midDelta := limit.Sub(start) / 2
 		return start.Add(midDelta), nil
 	}
 
-	limit, err := ptypes.Timestamp(c.NotAfterLimit)
-	if err != nil {
+	if err := c.NotAfterLimit.CheckValid(); err != nil {
 		return time.Time{}, fmt.Errorf("failed to parse NotAfterLimit: %v", err)
 	}
+	limit := c.NotAfterLimit.AsTime()
 	return limit.Add(-1 * time.Hour), nil
 }

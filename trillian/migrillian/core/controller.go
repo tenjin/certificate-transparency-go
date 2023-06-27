@@ -23,19 +23,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
-
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/client"
 	"github.com/google/certificate-transparency-go/scanner"
 	"github.com/google/certificate-transparency-go/trillian/migrillian/configpb"
+	"k8s.io/klog/v2"
 
-	"github.com/google/trillian/merkle"
-	_ "github.com/google/trillian/merkle/rfc6962" // Register hasher.
 	"github.com/google/trillian/monitoring"
-	"github.com/google/trillian/types"
 	"github.com/google/trillian/util/clock"
 	"github.com/google/trillian/util/election2"
+	"github.com/transparency-dev/merkle/proof"
+	"github.com/transparency-dev/merkle/rfc6962"
 )
 
 var (
@@ -129,7 +127,7 @@ func NewController(
 	mf monitoring.MetricFactory,
 ) *Controller {
 	initMetrics(mf)
-	l := strconv.FormatInt(plClient.tree.TreeId, 10)
+	l := strconv.FormatInt(plClient.treeID, 10)
 	return &Controller{opts: opts, ctClient: ctClient, plClient: plClient, ef: ef, label: l}
 }
 
@@ -137,14 +135,14 @@ func NewController(
 // configured with continuous mode, restarts it whenever it returns.
 func (c *Controller) RunWhenMasterWithRestarts(ctx context.Context) {
 	uri := c.ctClient.BaseURI()
-	treeID := c.plClient.tree.TreeId
+	treeID := c.plClient.treeID
 	for run := true; run; run = c.opts.Continuous && ctx.Err() == nil {
-		glog.Infof("Starting migration Controller (%d<-%q)", treeID, uri)
+		klog.Infof("Starting migration Controller (%d<-%q)", treeID, uri)
 		if err := c.RunWhenMaster(ctx); err != nil {
-			glog.Errorf("Controller.RunWhenMaster(%d<-%q): %v", treeID, uri, err)
+			klog.Errorf("Controller.RunWhenMaster(%d<-%q): %v", treeID, uri, err)
 			continue
 		}
-		glog.Infof("Controller stopped (%d<-%q)", treeID, uri)
+		klog.Infof("Controller stopped (%d<-%q)", treeID, uri)
 	}
 }
 
@@ -163,10 +161,11 @@ func (c *Controller) RunWhenMaster(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	metrics.isMaster.Set(0, c.label)
 	defer func(ctx context.Context) {
 		metrics.isMaster.Set(0, c.label)
 		if err := el.Close(ctx); err != nil {
-			glog.Warningf("%s: Election.Close(): %v", c.label, err)
+			klog.Warningf("%s: Election.Close(): %v", c.label, err)
 		}
 	}(ctx)
 
@@ -183,7 +182,7 @@ func (c *Controller) RunWhenMaster(ctx context.Context) error {
 			return err
 		}
 
-		glog.Infof("%s: running as master", c.label)
+		klog.Infof("%s: running as master", c.label)
 		metrics.masterRuns.Inc(c.label)
 
 		// Run while still master (or until an error).
@@ -195,7 +194,7 @@ func (c *Controller) RunWhenMaster(ctx context.Context) error {
 		} else if mctx.Err() == nil {
 			// We are still the master, so try to resign and emit the real error.
 			if rerr := el.Resign(ctx); rerr != nil {
-				glog.Errorf("%s: Election.Resign(): %v", c.label, rerr)
+				klog.Errorf("%s: Election.Resign(): %v", c.label, rerr)
 			}
 			return err
 		}
@@ -214,9 +213,10 @@ func (c *Controller) runWithRestarts(ctx context.Context) error {
 		return err
 	}
 	for err != nil && ctx.Err() == nil {
-		glog.Errorf("%s: Controller.Run: %v", c.label, err)
-		sleepRandom(ctx, 0, c.opts.StartDelay)
-		err = c.Run(ctx)
+		klog.Errorf("%s: Controller.Run: %v", c.label, err)
+		if slerr := sleepRandom(ctx, 0, c.opts.StartDelay); slerr == nil {
+			err = c.Run(ctx)
+		}
 	}
 	return ctx.Err()
 }
@@ -263,24 +263,24 @@ func (c *Controller) Run(ctx context.Context) error {
 // with respect to the passed in minimal position to start from, and the
 // current tree size obtained from an STH.
 func (c *Controller) fetchTail(ctx context.Context, begin uint64) (uint64, error) {
-	root, err := c.plClient.getVerifiedRoot(ctx)
+	treeSize, rootHash, err := c.plClient.getRoot(ctx)
 	if err != nil {
 		return 0, err
 	}
 
 	fo := c.opts.FetcherOptions
 	if fo.Continuous { // Ignore range parameters in continuous mode.
-		fo.StartIndex, fo.EndIndex = int64(root.TreeSize), 0
+		fo.StartIndex, fo.EndIndex = int64(treeSize), 0
 		// Use non-continuous Fetcher, as we implement continuity in Controller.
 		// TODO(pavelkalinnikov): Don't overload Fetcher's Continuous flag.
 		fo.Continuous = false
 	} else if fo.StartIndex < 0 {
-		fo.StartIndex = int64(root.TreeSize)
+		fo.StartIndex = int64(treeSize)
 	}
 	if int64(begin) > fo.StartIndex {
 		fo.StartIndex = int64(begin)
 	}
-	glog.Infof("%s: fetching range [%d, %d)", c.label, fo.StartIndex, fo.EndIndex)
+	klog.Infof("%s: fetching range [%d, %d)", c.label, fo.StartIndex, fo.EndIndex)
 
 	fetcher := scanner.NewFetcher(c.ctClient, &fo)
 	sth, err := fetcher.Prepare(ctx)
@@ -293,7 +293,7 @@ func (c *Controller) fetchTail(ctx context.Context, begin uint64) (uint64, error
 		return begin, nil
 	}
 
-	if err := c.verifyConsistency(ctx, root, sth); err != nil {
+	if err := c.verifyConsistency(ctx, treeSize, rootHash, sth); err != nil {
 		return 0, err
 	}
 
@@ -307,7 +307,7 @@ func (c *Controller) fetchTail(ctx context.Context, begin uint64) (uint64, error
 		go func() {
 			defer wg.Done()
 			if err := c.runSubmitter(cctx, batches); err != nil {
-				glog.Errorf("%s: Stopping due to submitter error: %v", c.label, err)
+				klog.Errorf("%s: Stopping due to submitter error: %v", c.label, err)
 				cancel() // Stop the other submitters and the Fetcher.
 			}
 		}()
@@ -327,23 +327,30 @@ func (c *Controller) fetchTail(ctx context.Context, begin uint64) (uint64, error
 	if err != nil {
 		return 0, err
 	}
+	// Run may have returned nil despite a cancel() call.
+	if err := cctx.Err(); err != nil {
+		return 0, fmt.Errorf("failed to fetch and submit the entire tail: %v", err)
+	}
 	return sth.TreeSize, nil
 }
 
 // verifyConsistency checks that the provided verified Trillian root is
 // consistent with the CT log's STH.
-func (c *Controller) verifyConsistency(ctx context.Context, root *types.LogRootV1, sth *ct.SignedTreeHead) error {
-	if c.opts.NoConsistencyCheck {
-		glog.Warningf("%s: skipping consistency check", c.label)
+func (c *Controller) verifyConsistency(ctx context.Context, treeSize uint64, rootHash []byte, sth *ct.SignedTreeHead) error {
+	if treeSize == 0 {
+		// Any head is consistent with empty root -- unnecessary to request empty proof.
 		return nil
 	}
-	proof, err := c.ctClient.GetSTHConsistency(ctx, root.TreeSize, sth.TreeSize)
+	if c.opts.NoConsistencyCheck {
+		klog.Warningf("%s: skipping consistency check", c.label)
+		return nil
+	}
+	pf, err := c.ctClient.GetSTHConsistency(ctx, treeSize, sth.TreeSize)
 	if err != nil {
 		return err
 	}
-	return merkle.NewLogVerifier(c.plClient.verif.Hasher).VerifyConsistencyProof(
-		int64(root.TreeSize), int64(sth.TreeSize),
-		root.RootHash, sth.SHA256RootHash[:], proof)
+	return proof.VerifyConsistency(rfc6962.DefaultHasher, treeSize, sth.TreeSize,
+		pf, rootHash, sth.SHA256RootHash[:])
 }
 
 // runSubmitter obtains CT log entry batches from the controller's channel and
@@ -362,7 +369,7 @@ func (c *Controller) runSubmitter(ctx context.Context, batches <-chan scanner.En
 			// shut down the Controller.
 			return fmt.Errorf("failed to add batch [%d, %d): %v", b.Start, end, err)
 		}
-		glog.Infof("%s: added batch [%d, %d)", c.label, b.Start, end)
+		klog.Infof("%s: added batch [%d, %d)", c.label, b.Start, end)
 		metrics.entriesStored.Add(entries, c.label)
 	}
 	return nil

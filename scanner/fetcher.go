@@ -16,14 +16,22 @@ package scanner
 
 import (
 	"context"
+	"net/http"
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
 	ct "github.com/google/certificate-transparency-go"
-	"github.com/google/certificate-transparency-go/client"
+	"github.com/google/certificate-transparency-go/jsonclient"
 	"github.com/google/trillian/client/backoff"
+	"k8s.io/klog/v2"
 )
+
+// LogClient implements the subset of CT log API that the Fetcher uses.
+type LogClient interface {
+	BaseURI() string
+	GetSTH(context.Context) (*ct.SignedTreeHead, error)
+	GetRawEntries(ctx context.Context, start, end int64) (*ct.GetEntriesResponse, error)
+}
 
 // FetcherOptions holds configuration options for the Fetcher.
 type FetcherOptions struct {
@@ -59,7 +67,7 @@ type Fetcher struct {
 	// Base URI of the CT log, for diagnostics.
 	uri string
 	// Client used to talk to the CT log instance.
-	client *client.LogClient
+	client LogClient
 	// Configuration options for this Fetcher instance.
 	opts *FetcherOptions
 
@@ -87,7 +95,7 @@ type fetchRange struct {
 
 // NewFetcher creates a Fetcher instance using client to talk to the log,
 // taking configuration options from opts.
-func NewFetcher(client *client.LogClient, opts *FetcherOptions) *Fetcher {
+func NewFetcher(client LogClient, opts *FetcherOptions) *Fetcher {
 	cancel := func() {} // Protect against calling Stop before Run.
 	return &Fetcher{
 		uri:    client.BaseURI(),
@@ -106,13 +114,13 @@ func (f *Fetcher) Prepare(ctx context.Context) (*ct.SignedTreeHead, error) {
 
 	sth, err := f.client.GetSTH(ctx)
 	if err != nil {
-		glog.Errorf("%s: GetSTH() failed: %v", f.uri, err)
+		klog.Errorf("%s: GetSTH() failed: %v", f.uri, err)
 		return nil, err
 	}
-	glog.Infof("%s: Got STH with %d certs", f.uri, sth.TreeSize)
+	klog.V(1).Infof("%s: Got STH with %d certs", f.uri, sth.TreeSize)
 
 	if size := int64(sth.TreeSize); f.opts.EndIndex == 0 || f.opts.EndIndex > size {
-		glog.Infof("%s: Reset EndIndex from %d to %d", f.uri, f.opts.EndIndex, size)
+		klog.V(1).Infof("%s: Reset EndIndex from %d to %d", f.uri, f.opts.EndIndex, size)
 		f.opts.EndIndex = size
 	}
 	f.sth = sth
@@ -123,7 +131,7 @@ func (f *Fetcher) Prepare(ctx context.Context) (*ct.SignedTreeHead, error) {
 // passed in context is canceled, or Stop is called (and pending work is
 // finished). For each successfully fetched batch, runs the fn callback.
 func (f *Fetcher) Run(ctx context.Context, fn func(EntryBatch)) error {
-	glog.V(1).Infof("%s: Starting up Fetcher...", f.uri)
+	klog.V(1).Infof("%s: Starting up Fetcher...", f.uri)
 	if _, err := f.Prepare(ctx); err != nil {
 		return err
 	}
@@ -146,14 +154,14 @@ func (f *Fetcher) Run(ctx context.Context, fn func(EntryBatch)) error {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			glog.V(1).Infof("%s: Fetcher worker %d starting...", f.uri, idx)
+			klog.V(1).Infof("%s: Fetcher worker %d starting...", f.uri, idx)
 			f.runWorker(ctx, ranges, fn)
-			glog.V(1).Infof("%s: Fetcher worker %d finished", f.uri, idx)
+			klog.V(1).Infof("%s: Fetcher worker %d finished", f.uri, idx)
 		}(w)
 	}
 	wg.Wait()
 
-	glog.V(1).Infof("%s: Fetcher terminated", f.uri)
+	klog.V(1).Infof("%s: Fetcher terminated", f.uri)
 	return nil
 }
 
@@ -174,8 +182,8 @@ func (f *Fetcher) genRanges(ctx context.Context) <-chan fetchRange {
 	ranges := make(chan fetchRange)
 
 	go func() {
-		glog.V(1).Infof("%s: Range generator starting", f.uri)
-		defer glog.V(1).Infof("%s: Range generator finished", f.uri)
+		klog.V(1).Infof("%s: Range generator starting", f.uri)
+		defer klog.V(1).Infof("%s: Range generator finished", f.uri)
 		defer close(ranges)
 		start, end := f.opts.StartIndex, f.opts.EndIndex
 
@@ -184,7 +192,7 @@ func (f *Fetcher) genRanges(ctx context.Context) <-chan fetchRange {
 			// including, possibly, the very first iteration.
 			if start == end { // Implies f.opts.Continuous == true.
 				if err := f.updateSTH(ctx); err != nil {
-					glog.Warningf("%s: Failed to obtain bigger STH: %v", f.uri, err)
+					klog.Warningf("%s: Failed to obtain bigger STH: %v", f.uri, err)
 					return
 				}
 				end = f.opts.EndIndex
@@ -194,7 +202,7 @@ func (f *Fetcher) genRanges(ctx context.Context) <-chan fetchRange {
 			next := fetchRange{start, batchEnd - 1}
 			select {
 			case <-ctx.Done():
-				glog.Warningf("%s: Cancelling genRanges: %v", f.uri, ctx.Err())
+				klog.Warningf("%s: Cancelling genRanges: %v", f.uri, ctx.Err())
 				return
 			case ranges <- next:
 			}
@@ -230,9 +238,9 @@ func (f *Fetcher) updateSTH(ctx context.Context) error {
 	return f.sthBackoff.Retry(ctx, func() error {
 		sth, err := f.client.GetSTH(ctx)
 		if err != nil {
-			return err
+			return backoff.RetriableErrorf("GetSTH: %v", err)
 		}
-		glog.V(2).Infof("%s: Got STH with %d certs", f.uri, sth.TreeSize)
+		klog.V(2).Infof("%s: Got STH with %d certs", f.uri, sth.TreeSize)
 
 		quick := time.Now().Before(quickDeadline)
 		if sth.TreeSize <= lastSize || quick && sth.TreeSize < targetSize {
@@ -257,15 +265,33 @@ func (f *Fetcher) runWorker(ctx context.Context, ranges <-chan fetchRange, fn fu
 		// Logs MAY return fewer than the number of leaves requested. Only complete
 		// if we actually got all the leaves we were expecting.
 		for r.start <= r.end {
-			// Fetcher.Run() can be cancelled while we are looping over this job.
-			if err := ctx.Err(); err != nil {
-				glog.Warningf("%s: Worker context closed: %v", f.uri, err)
+			if ctx.Err() != nil { // Prevent spinning when context is canceled.
 				return
 			}
-			resp, err := f.client.GetRawEntries(ctx, r.start, r.end)
-			if err != nil {
-				glog.Errorf("%s: GetRawEntries() failed: %v", f.uri, err)
-				// TODO(pavelkalinnikov): Introduce backoff policy and pause here.
+			// TODO(pavelkalinnikov): Make these parameters tunable.
+			// This backoff will only apply to a single request and be reset for the next one.
+			// This precludes reaching some kind of stability in request rate, but means that
+			// an intermittent problem won't harm long-term running of the worker.
+			bo := &backoff.Backoff{
+				Min:    1 * time.Second,
+				Max:    30 * time.Second,
+				Factor: 2,
+				Jitter: true,
+			}
+
+			var resp *ct.GetEntriesResponse
+			// TODO(pavelkalinnikov): Report errors in a LogClient decorator on failure.
+			if err := bo.Retry(ctx, func() error {
+				var err error
+				resp, err = f.client.GetRawEntries(ctx, r.start, r.end)
+				return err
+			}); err != nil {
+				if rspErr, isRspErr := err.(jsonclient.RspError); isRspErr && rspErr.StatusCode == http.StatusTooManyRequests {
+					klog.V(2).Infof("%s: GetRawEntries() failed: %v", f.uri, err)
+				} else {
+					klog.Errorf("%s: GetRawEntries() failed: %v", f.uri, err)
+				}
+				// There is no error reporting yet for this worker, so just retry again.
 				continue
 			}
 			fn(EntryBatch{Start: r.start, Entries: resp.Entries})

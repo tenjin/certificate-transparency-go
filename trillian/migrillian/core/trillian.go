@@ -22,18 +22,16 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/golang/glog"
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/scanner"
 	"github.com/google/certificate-transparency-go/trillian/migrillian/configpb"
 	"github.com/google/certificate-transparency-go/x509"
 	"github.com/google/trillian"
-	"github.com/google/trillian/client"
 	"github.com/google/trillian/client/backoff"
-	"github.com/google/trillian/crypto"
 	"github.com/google/trillian/types"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"k8s.io/klog/v2"
 )
 
 var errRetry = errors.New("retry")
@@ -42,8 +40,7 @@ var errRetry = errors.New("retry")
 // pre-ordered log tree.
 type PreorderedLogClient struct {
 	cli    trillian.TrillianLogClient
-	verif  *client.LogVerifier
-	tree   *trillian.Tree
+	treeID int64
 	idFunc func(int64, *ct.RawLogEntry) []byte
 	prefix string // TODO(pavelkalinnikov): Get rid of this.
 }
@@ -61,11 +58,7 @@ func NewPreorderedLogClient(
 	if got, want := tree.TreeType, trillian.TreeType_PREORDERED_LOG; got != want {
 		return nil, fmt.Errorf("tree %d is %v, want %v", tree.TreeId, got, want)
 	}
-	v, err := client.NewLogVerifierFromTree(tree)
-	if err != nil {
-		return nil, err
-	}
-	ret := PreorderedLogClient{cli: cli, verif: v, tree: tree, prefix: prefix}
+	ret := PreorderedLogClient{cli: cli, treeID: tree.TreeId, prefix: prefix}
 
 	switch idFuncType {
 	case configpb.IdentityFunction_SHA256_CERT_DATA:
@@ -79,17 +72,20 @@ func NewPreorderedLogClient(
 	return &ret, nil
 }
 
-// getVerifiedRoot returns the current root of the Trillian tree. Verifies the
-// log's signature.
-func (c *PreorderedLogClient) getVerifiedRoot(ctx context.Context) (*types.LogRootV1, error) {
-	req := trillian.GetLatestSignedLogRootRequest{LogId: c.tree.TreeId}
+// getRoot returns the current root of the Trillian tree.
+func (c *PreorderedLogClient) getRoot(ctx context.Context) (uint64, []byte, error) {
+	req := trillian.GetLatestSignedLogRootRequest{LogId: c.treeID}
 	rsp, err := c.cli.GetLatestSignedLogRoot(ctx, &req)
 	if err != nil {
-		return nil, err
+		return 0, nil, err
 	} else if rsp == nil || rsp.SignedLogRoot == nil {
-		return nil, errors.New("missing SignedLogRoot")
+		return 0, nil, errors.New("missing SignedLogRoot")
 	}
-	return crypto.VerifySignedLogRoot(c.verif.PubKey, c.verif.SigHash, rsp.SignedLogRoot)
+	var logRoot types.LogRootV1
+	if err := logRoot.UnmarshalBinary(rsp.SignedLogRoot.LogRoot); err != nil {
+		return 0, nil, err
+	}
+	return logRoot.TreeSize, logRoot.RootHash, nil
 }
 
 // addSequencedLeaves converts a batch of CT log entries into Trillian log
@@ -108,8 +104,7 @@ func (c *PreorderedLogClient) addSequencedLeaves(ctx context.Context, b *scanner
 			return err
 		}
 	}
-	treeID := c.tree.TreeId
-	req := trillian.AddSequencedLeavesRequest{LogId: treeID, Leaves: leaves}
+	req := trillian.AddSequencedLeavesRequest{LogId: c.treeID, Leaves: leaves}
 
 	// TODO(pavelkalinnikov): Make this strategy configurable.
 	bo := backoff.Backoff{
@@ -120,13 +115,13 @@ func (c *PreorderedLogClient) addSequencedLeaves(ctx context.Context, b *scanner
 	}
 
 	var err error
-	bo.Retry(ctx, func() error {
+	boerr := bo.Retry(ctx, func() error {
 		var rsp *trillian.AddSequencedLeavesResponse
 		rsp, err = c.cli.AddSequencedLeaves(ctx, &req)
 		switch status.Code(err) {
 		case codes.ResourceExhausted: // There was (probably) a quota error.
 			end := b.Start + int64(len(b.Entries))
-			glog.Errorf("%d: retrying batch [%d, %d) due to error: %v", treeID, b.Start, end, err)
+			klog.Errorf("%d: retrying batch [%d, %d) due to error: %v", c.treeID, b.Start, end, err)
 			return errRetry
 		case codes.OK:
 			if rsp == nil {
@@ -138,8 +133,12 @@ func (c *PreorderedLogClient) addSequencedLeaves(ctx context.Context, b *scanner
 			return nil // Stop backing off, and return err as is below.
 		}
 	})
-
-	return err
+	if err != nil {
+		// Return the more specific error if available
+		return err
+	}
+	// Return the timeout, or nil on success
+	return boerr
 }
 
 func (c *PreorderedLogClient) buildLogLeaf(index int64, entry *ct.LeafEntry) (*trillian.LogLeaf, error) {
@@ -151,9 +150,9 @@ func (c *PreorderedLogClient) buildLogLeaf(index int64, entry *ct.LeafEntry) (*t
 	// Don't return on x509 parsing errors because we want to migrate this log
 	// entry as is. But log the error so that it can be flagged by monitoring.
 	if _, err = rle.ToLogEntry(); x509.IsFatal(err) {
-		glog.Errorf("%s: index=%d: x509 fatal error: %v", c.prefix, index, err)
+		klog.Errorf("%s: index=%d: x509 fatal error: %v", c.prefix, index, err)
 	} else if err != nil {
-		glog.Infof("%s: index=%d: x509 non-fatal error: %v", c.prefix, index, err)
+		klog.Infof("%s: index=%d: x509 non-fatal error: %v", c.prefix, index, err)
 	}
 	// TODO(pavelkalinnikov): Verify cert chain if error is nil or non-fatal.
 

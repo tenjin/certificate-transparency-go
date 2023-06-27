@@ -18,8 +18,9 @@ package ctpolicy
 import (
 	"fmt"
 	"sync"
+	"time"
 
-	"github.com/google/certificate-transparency-go/loglist2"
+	"github.com/google/certificate-transparency-go/loglist3"
 	"github.com/google/certificate-transparency-go/x509"
 )
 
@@ -30,12 +31,13 @@ const (
 
 // LogGroupInfo holds information on a single group of logs specified by Policy.
 type LogGroupInfo struct {
-	Name          string
-	LogURLs       map[string]bool    // set of members
-	MinInclusions int                // Required number of submissions.
-	IsBase        bool               // True only for Log-group covering all logs.
-	LogWeights    map[string]float32 // weights used for submission, default weight is 1
-	wMu           sync.RWMutex       // guards weights
+	Name                 string
+	LogURLs              map[string]bool    // set of members
+	MinInclusions        int                // Required number of submissions.
+	MinDistinctOperators int                // Required number of distinct CT log operators that submit an SCT.
+	IsBase               bool               // True only for Log-group covering all logs.
+	LogWeights           map[string]float32 // weights used for submission, default weight is 1
+	wMu                  sync.RWMutex       // guards weights
 }
 
 func (group *LogGroupInfo) setMinInclusions(i int) error {
@@ -50,7 +52,7 @@ func (group *LogGroupInfo) setMinInclusions(i int) error {
 	return nil
 }
 
-func (group *LogGroupInfo) populate(ll *loglist2.LogList, included func(op *loglist2.Operator) bool) {
+func (group *LogGroupInfo) populate(ll *loglist3.LogList, included func(op *loglist3.Operator) bool) {
 	group.LogURLs = make(map[string]bool)
 	group.LogWeights = make(map[string]float32)
 	for _, op := range ll.Operators {
@@ -180,14 +182,14 @@ func (groups LogPolicyData) TotalLogs() int {
 type CTPolicy interface {
 	// LogsByGroup provides info on Log-grouping. Returns an error if it's not
 	// possible to satisfy the policy with the provided loglist.
-	LogsByGroup(cert *x509.Certificate, approved *loglist2.LogList) (LogPolicyData, error)
+	LogsByGroup(cert *x509.Certificate, approved *loglist3.LogList) (LogPolicyData, error)
 	Name() string
 }
 
 // BaseGroupFor creates and propagates all-log group.
-func BaseGroupFor(approved *loglist2.LogList, incCount int) (*LogGroupInfo, error) {
+func BaseGroupFor(approved *loglist3.LogList, incCount int) (*LogGroupInfo, error) {
 	baseGroup := LogGroupInfo{Name: BaseName, IsBase: true}
-	baseGroup.populate(approved, func(op *loglist2.Operator) bool { return true })
+	baseGroup.populate(approved, func(op *loglist3.Operator) bool { return true })
 	err := baseGroup.setMinInclusions(incCount)
 	return &baseGroup, err
 }
@@ -203,6 +205,13 @@ func lifetimeInMonths(cert *x509.Certificate) int {
 		lifetimeInMonths--
 	}
 	return lifetimeInMonths
+}
+
+// certLifetime calculates and returns the lifetime of the given certificate as a time.Duration
+func certLifetime(cert *x509.Certificate) time.Duration {
+	start := cert.NotBefore
+	end := cert.NotAfter
+	return end.Sub(start)
 }
 
 // GroupSet is set of Log-group names.
