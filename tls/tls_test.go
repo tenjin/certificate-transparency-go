@@ -68,6 +68,33 @@ type testSliceOfSlices struct {
 	Inners []testInnerType `tls:"minlen:0,maxlen:65535"`
 }
 
+func TestFieldTagRejectsOversizedSelectorWidth(t *testing.T) {
+	for _, tag := range []string{
+		"selector:Which,val:1,size:9",
+		"selector:Which,val:1,size:4294967295",
+		"size:4294967295,selector:Which,val:1",
+	} {
+		if _, err := fieldTagToFieldInfo(tag, "Value"); err == nil {
+			t.Errorf("fieldTagToFieldInfo(%q) succeeded, want oversized width error", tag)
+		}
+	}
+}
+
+func TestUnmarshalOversizedSliceLength(t *testing.T) {
+	for _, data := range [][]byte{
+		{0x80, 0, 0, 0, 0, 0, 0, 0},
+		{0, 0, 0, 1, 0, 0, 0, 0},
+		{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+	} {
+		var value struct {
+			Data []byte `tls:"maxlen:18446744073709551615"`
+		}
+		if _, err := Unmarshal(data, &value); err == nil || !strings.Contains(err.Error(), "truncated slice") {
+			t.Errorf("Unmarshal(%x) error = %v, want truncated slice", data, err)
+		}
+	}
+}
+
 func TestMarshalUnmarshalRoundTrip(t *testing.T) {
 	thing := testStruct{Data: []byte{0x01, 0x02, 0x03}, IntVal: 42, Other: [4]byte{1, 2, 3, 4}, Enum: 17}
 	data, err := Marshal(thing)
@@ -183,10 +210,12 @@ func TestUnmarshalMarshalWithParamsRoundTrip(t *testing.T) {
 		{"03", "", &[1]byte{3}},
 		{"0001", "size:2", newEnum(1)},
 		{"0100000001", "size:5", newEnum(0x100000001)},
+		{"0000000000000001", "size:8", newEnum(1)},
 		{"12", "maxval:18", newEnum(18)},
 		// Note that maxval is just used to give enum size; it's not policed
 		{"20", "maxval:18", newEnum(32)},
 		{"020a0b", "minlen:1,maxlen:5", &[]byte{0xa, 0xb}},
+		{"00000000000000020a0b", "minlen:1,maxlen:18446744073709551615", &[]byte{0xa, 0xb}},
 		{"020a0b0101010203040011", "", &testStruct{Data: []byte{0xa, 0xb}, IntVal: 0x101, Other: [4]byte{1, 2, 3, 4}, Enum: 17}},
 		{"000102", "", &testVariant{Which: 0, Val16: newUint16(0x0102)}},
 		{"0101020304", "", &testVariant{Which: 1, Val32: newUint32(0x01020304)}},

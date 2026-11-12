@@ -74,8 +74,8 @@ and is [documented separately](trillian/README.md).
 
 ## Working on the Code
 
-Developers who want to make changes to the codebase need some additional
-dependencies and tools, described in the following sections.
+Development requires Go 1.27.4 or newer. Additional dependencies and tools
+are described in the following sections.
 
 ### Running Codebase Checks
 
