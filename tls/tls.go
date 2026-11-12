@@ -256,11 +256,12 @@ func fieldTagToFieldInfo(str string, name string) (*fieldInfo, error) {
 	}
 	if info != nil {
 		info.name = name
+		if info.count > 8 {
+			return nil, structuralError{name, "specified size too large in " + str}
+		}
 		if info.selector == "" {
 			if info.count < 1 {
 				return nil, structuralError{name, "field of unknown size in " + str}
-			} else if info.count > 8 {
-				return nil, structuralError{name, "specified size too large in " + str}
 			} else if info.minlen > info.maxlen {
 				return nil, structuralError{name, "specified length range inverted in " + str}
 			} else if info.val > 0 {
@@ -275,7 +276,7 @@ func fieldTagToFieldInfo(str string, name string) (*fieldInfo, error) {
 
 // Check that a value fits into a field described by a fieldInfo structure.
 func (i fieldInfo) check(val uint64, fldName string) error {
-	if val >= (1 << (8 * i.count)) {
+	if i.count < 8 && val >= (1 << (8 * i.count)) {
 		return structuralError{fldName, fmt.Sprintf("value %d too large for size", val)}
 	}
 	if i.maxlen != 0 {
@@ -468,13 +469,13 @@ func parseField(v reflect.Value, data []byte, initOffset int, info *fieldInfo) (
 		if err != nil {
 			return offset, err
 		}
-		datalen := int(varlen)
 		offset += int(info.count)
 		rest = rest[info.count:]
 
-		if datalen > len(rest) {
+		if varlen > uint64(len(rest)) {
 			return offset, syntaxError{info.fieldName(), "truncated slice"}
 		}
+		datalen := int(varlen)
 		inner := rest[:datalen]
 		offset += datalen
 		if fieldType.Elem().Kind() == reflect.Uint8 {
